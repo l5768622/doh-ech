@@ -147,11 +147,49 @@ function buildConfig(url, headers = null) {
         clientIp: get('clientIp', 'X-ClientIP') || '',
         no6: get('no6', 'X-No6') || 'false',   
         mandatory: get('mandatory', 'X-Mandatory') || 'alpn',
-        nocf6: get('nocf6', 'X-NoCF6') || 'false'
+        nocf6: get('nocf6', 'X-NoCF6') || 'false',
+        googlev4: get('googlev4', 'X-GoogleV4') || 'false'
     };
     config.ip4 = prescreenIpList(config.ip4);//预筛选
     config.ip6 = prescreenIpList(config.ip6);
     return config;
+}
+
+// ===================== iOS 专用免参数端点 =====================
+// Apple 描述文件 (com.apple.dnsSettings.managed) 的 ServerURL 是否保留查询参数，官方只写
+// 「RFC 8484 URI template」并未明确。为消除这个不确定性，把参数固化在服务端：
+// 描述文件只需填 https://<你的域名>/ios
+const IOS_PATH = '/ios';
+const IOS_PATH_ALT = '/iphone';
+const IOS_DEFAULTS = {
+    cf: 'polestar.com,icook.tw,time.is',
+    best: 'true',
+    enhance: 'full',
+    alpn: 'h3,h2',
+    shuffle: 'true',
+    nocf6: 'false'
+};
+
+async function handleIosRequest(req, url, ctx, clientIP) {
+    const merged = new URL(url.toString());
+    merged.pathname = '/ech';
+    for (const [k, v] of Object.entries(IOS_DEFAULTS)) {
+        if (!merged.searchParams.has(k)) merged.searchParams.set(k, v);
+    }
+    const config = buildConfig(merged, req.headers);
+    if (!config.clientIp) config.clientIp = clientIP;
+    await applySubConfig(config);
+    if (req.method === 'POST') {
+        const buf = await req.arrayBuffer();
+        return handleDnsQuery(buf, config, ctx, config.clientIp);
+    }
+    const dnsParam = merged.searchParams.get('dns');
+    if (req.method === 'GET' && dnsParam) {
+        const raw = dnsParam.replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
+        const buf = Uint8Array.from(atob(raw), c => c.charCodeAt(0)).buffer;
+        return handleDnsQuery(buf, config, ctx, config.clientIp);
+    }
+    return new Response('OK', { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
 }
 
 // ===================== Worker 入口 =====================
@@ -165,6 +203,7 @@ export default {
         if (url.pathname === '/log') {return handleLogsRequest();}
         const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '1.2.4.8';
         if (url.pathname === '/api/query') return handleApiQuery(url, clientIP);
+        if (url.pathname === IOS_PATH || url.pathname === IOS_PATH_ALT) return handleIosRequest(req, url, ctx, clientIP);
         if (url.pathname === '/ech') return handleDoHRequest(req, true, ctx, clientIP);
         if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP);
         return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
@@ -202,6 +241,13 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
         const { id, questions } = query;
         const qType = questions[0].type;
         const qName = questions[0].name.toLowerCase().replace(/\.$/, "");
+
+        // 只接管 A(1)/AAAA(28)/HTTPS(65)。其余类型（TXT/MX/NS/CNAME/SRV/SOA…）原样转发上游，
+        // 否则会被当成 A 去解析、再按原类型打包，产出「4 字节 IP 冒充 TXT」这类坏记录。
+        if (qType !== 1 && qType !== 28 && qType !== 65) {
+            const res = await forwardQuery(rawBuffer);
+            return dnsResponse(await res.arrayBuffer());
+        }
 
         // 假名处理
         if (qName === "cf.ech" || qName === "fb.ech") {
@@ -318,7 +364,10 @@ async function resolveDNS(domain, type, config, clientIP) {
      }
     // 增强模式规则屏蔽 / 指定 IP（对所有域名生效，包括静态域名）
     if (config.enhance === 'rule' || config.enhance === 'full') {
-        const ruleObj = await matchRule(domain, config);
+        let ruleObj = await matchRule(domain, config);
+        // googlev4=1：A 查询被规则的 noA 屏蔽时放弃该规则，改由上游返回真实 IPv4
+        const gv4 = ['true', '1', 'yes', 'on'].includes(String(config.googlev4).toLowerCase());
+        if (ruleObj && ruleObj.noA && gv4) ruleObj = null;
         if (ruleObj) {
             // 规则指定了对应类型的 IP → 直接返回规则 IP
             if (type === 'A' && ruleObj.ips.some(ip => !ip.includes(':'))) {
